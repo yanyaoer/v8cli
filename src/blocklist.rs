@@ -8,6 +8,38 @@ const DEFAULT_RULES: &str = include_str!("blocklist.txt");
 /// session: matching is a few microseconds, building is tens of milliseconds.
 pub struct Blocklist {
     engine: Engine,
+    url_patterns: Vec<String>,
+}
+
+/// Translate the `||host^` rules of a filter list into CDP glob patterns for
+/// `Page::set_blocked_urls`. Only unqualified host rules are lifted: anything
+/// carrying options (`$third-party`), paths, or wildcards needs the full engine
+/// and stays on the interception path, where request context is available.
+fn host_patterns(rules: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in rules.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("||") else { continue };
+        let Some(host) = rest.strip_suffix('^') else { continue };
+        let valid = !host.is_empty()
+            && !host.starts_with('.')
+            && !host.ends_with('.')
+            && !host.contains("..")
+            && host.contains('.')
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        if !valid {
+            continue;
+        }
+        // `||host^` matches the host and any subdomain; a CDP pattern anchors on
+        // a literal run, so the two shapes are emitted separately.
+        out.push(format!("*://{host}/*"));
+        out.push(format!("*://*.{host}/*"));
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 impl Blocklist {
@@ -16,17 +48,33 @@ impl Blocklist {
     /// can rely purely on its own lists.
     pub fn new(extra: &[String], use_default: bool) -> Result<Self, String> {
         let mut set = FilterSet::new(false);
+        let mut url_patterns = Vec::new();
         if use_default {
+            url_patterns.extend(host_patterns(DEFAULT_RULES));
             set.add_filter_list(DEFAULT_RULES.to_string(), ParseOptions::default());
         }
         for path in extra {
             let rules = std::fs::read_to_string(path)
                 .map_err(|e| format!("cannot read filter list {path}: {e}"))?;
+            // Deliberately not lifted to URL patterns: Obscura scans those
+            // linearly for every request, and a community list contributes tens
+            // of thousands of them (EasyPrivacy alone yields ~42k). These rules
+            // still apply to page-JS requests through the engine, whose matching
+            // is indexed and takes microseconds regardless of list size.
             set.add_filter_list(rules, ParseOptions::default());
         }
+        url_patterns.sort();
+        url_patterns.dedup();
         Ok(Self {
             engine: Engine::new_with_filter_set(set),
+            url_patterns,
         })
+    }
+
+    /// Glob patterns for `Page::set_blocked_urls`, which reaches the parser's
+    /// `<script src>` fetches that interception never sees.
+    pub fn url_patterns(&self) -> Vec<String> {
+        self.url_patterns.clone()
     }
 
     /// `resource_type` follows the Adblock Plus vocabulary: "script", "xhr",
@@ -129,9 +177,50 @@ mod tests {
         assert!(list.blocks("https://first-party-cdn.example/a.js", page, "script"));
         // built-in rules survive alongside the extra list
         assert!(list.blocks("https://www.google-analytics.com/analytics.js", page, "script"));
+        // extra lists reach the engine but are kept out of the linear URL matcher
+        assert!(!list
+            .url_patterns()
+            .iter()
+            .any(|p| p.contains("first-party-cdn.example")));
 
         assert!(Blocklist::new(&["/nonexistent/list.txt".to_string()], true).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_rules_become_glob_patterns_for_both_apex_and_subdomains() {
+        let patterns = host_patterns("||doubleclick.net^\n");
+        assert_eq!(
+            patterns,
+            vec!["*://*.doubleclick.net/*", "*://doubleclick.net/*"]
+        );
+    }
+
+    #[test]
+    fn only_unqualified_host_rules_are_lifted_to_patterns() {
+        // Options, paths and wildcards need request context, so they stay with
+        // the engine rather than becoming a blunt URL glob.
+        let rules = "\
+||heap.io$third-party
+||ads.example.com/tag.js
+||*.evil
+! a comment
+/banner/*.gif
+||tracker.example^
+";
+        assert_eq!(
+            host_patterns(rules),
+            vec!["*://*.tracker.example/*", "*://tracker.example/*"]
+        );
+    }
+
+    #[test]
+    fn default_list_yields_patterns_and_they_reach_the_engine_too() {
+        let list = default_list();
+        let patterns = list.url_patterns();
+        assert!(patterns.contains(&"*://*.doubleclick.net/*".to_string()));
+        assert!(patterns.iter().all(|p| p.starts_with("*://")));
+        assert!(patterns.len() > 100, "got {} patterns", patterns.len());
     }
 
     #[test]

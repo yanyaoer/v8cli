@@ -93,7 +93,6 @@ struct Engine {
     /// Shared with the interception task so it can judge first- vs third-party
     /// against the document currently loaded, not the one at startup.
     page_url: Arc<Mutex<String>>,
-    blocked: Arc<Mutex<u64>>,
 }
 
 impl Engine {
@@ -105,20 +104,20 @@ impl Engine {
         let browser = builder.build().map_err(|e| e.to_string())?;
         let mut page = browser.new_page().await.map_err(|e| e.to_string())?;
         let page_url = Arc::new(Mutex::new(String::new()));
-        let blocked = Arc::new(Mutex::new(0u64));
 
         if let Some(blocklist) = blocklist {
+            // Two complementary paths: URL patterns reach the parser's
+            // <script src> fetches (and the JS runtime's own check), while
+            // interception applies the full engine, including community list
+            // rules that need request context, to what page JS requests.
+            page.set_blocked_urls(blocklist.url_patterns());
             let mut requests = page.enable_interception();
             let task_url = Arc::clone(&page_url);
-            let task_blocked = Arc::clone(&blocked);
             tokio::spawn(async move {
                 while let Some(request) = requests.recv().await {
                     let source = task_url.lock().map(|u| u.clone()).unwrap_or_default();
                     let deny = blocklist.blocks(&request.url, &source, &request.resource_type);
                     let resolution = if deny {
-                        if let Ok(mut n) = task_blocked.lock() {
-                            *n += 1;
-                        }
                         InterceptResolution::Fail {
                             reason: "blocked by v8cli filter list".into(),
                         }
@@ -143,12 +142,7 @@ impl Engine {
             browser,
             page,
             page_url,
-            blocked,
         })
-    }
-
-    fn blocked_count(&self) -> u64 {
-        self.blocked.lock().map(|n| *n).unwrap_or(0)
     }
 
     fn add_cookies(&self, target: &Url, cookies: &[String]) -> Result<(), String> {
@@ -324,10 +318,6 @@ async fn run_cli() -> Result<(), String> {
                     Mode::Html => engine.html(),
                 }
             };
-            let blocked = engine.blocked_count();
-            if blocked > 0 {
-                eprintln!("filters: blocked {blocked} ad/telemetry requests");
-            }
             print_value(output);
         }
         Cmd::Serve { filters } => {

@@ -129,14 +129,23 @@ v8cli open <url> --no-default-filters --filter-list my.txt
 curl -o easyprivacy.txt https://easylist.to/easylist/easyprivacy.txt
 ```
 
-拦截命中数会打到 stderr。实测在 theverge.com 上移除了 OneTrust 同意横幅的
-631 词样板文本,正文一字未少。
+走两条互补路径:内置列表的 `||host^` 规则转成 glob 交给 `Page::set_blocked_urls`,
+覆盖 parser 在初始 HTML 中发现的 `<script src>`(前置广告脚本,最贵的一批);
+完整引擎经 `enable_interception` 作用于页面 JS 发起的 `fetch()`/XHR。
 
-**当前覆盖范围有限**:只作用于页面 JS 发起的 `fetch()`/XHR(Obscura 的
-`enable_interception` 范围)。parser 在初始 HTML 中发现的 `<script src>`
-走 `obscura-browser` 内部抓取路径,不经过拦截器,因此 `gpt.js`、
-`amazon-adsystem` 这类**前置广告脚本目前拦不掉**,提速也因此有限。
-补齐需要在 Obscura 侧加 hook。
+实测(median of 3):
+
+| 站点 | `--no-block` | 默认拦截 | 正文 |
+|-|-|-|-|
+| theverge.com | 6654ms | **4761ms** | 仅少 OneTrust 同意横幅的 631 词 |
+| github.com | 8781ms | **6003ms** | 逐字节相同 |
+| cnn.com | 8304ms | 8288ms | 逐字节相同 |
+| example.com | 596ms | 520ms | 逐字节相同 |
+
+`--filter-list` 加载的社区列表**只进引擎**(作用于页面 JS 请求),不转成 URL glob:
+Obscura 对 glob 是逐请求线性扫描,而 EasyPrivacy 一份就产生约 4.2 万条。
+另注意社区列表收益不稳定——实测 theverge 略快(4660→4364ms),cnn 反而更慢
+(7884→10362ms),建议按站点验证后再启用。
 
 ## 设计边界
 
@@ -147,10 +156,26 @@ curl -o easyprivacy.txt https://easylist.to/easylist/easyprivacy.txt
 - `eval` 中原生 `fetch`/`Response` 是标准异步 API，不再是旧版同步 shim。
 - 每次进程启动是独立会话；`serve` 可在进程生命周期内保持状态。
 
+## 本地 Obscura patch
+
+`Cargo.toml` 里有一条 `[patch]` 指向 `../obscura`,给公开的 `Page` 补上
+`set_blocked_urls`(该能力在 `obscura-browser` 内部早已存在,并同时被
+parser 脚本抓取循环和 JS runtime 使用,只是没在 facade crate 上暴露)。
+
+因此**构建需要相邻目录有这份 fork**:
+
+```sh
+git clone https://github.com/h4ckf0r0day/obscura ../obscura
+cd ../obscura && git checkout 41f24d7a19d729b84c2c64ea8ef1d52711b94fab
+# 再应用 feat/subresource-filter 分支上那一个 commit
+```
+
+上游合并后删掉 `[patch]` 段即可。
+
 ## 开发验证
 
 ```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test                                    # 15 passed
+cargo clippy --all-targets -p v8cli -- -D warnings
 cargo build --release
 ```
