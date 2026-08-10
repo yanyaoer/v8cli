@@ -1,0 +1,96 @@
+! v8cli default blocklist — Adblock Plus syntax.
+!
+! Scope: third-party ad-tech, analytics, tag managers, session replay and
+! telemetry entry points. These download and execute but contribute nothing to
+! the semantic tree, and each one typically injects a further waterfall of
+! requests. Deliberately excluded: code CDNs (jsdelivr, unpkg, cdnjs), CAPTCHA
+! and auth providers, and anything first-party — those can carry real content.
+!
+! This file is v8cli's own work, kept small on purpose. For exhaustive coverage
+! load a community list at runtime, which avoids redistributing it:
+!   curl -o easyprivacy.txt https://easylist.to/easylist/easyprivacy.txt
+!   v8cli open <url> --filter-list easyprivacy.txt
+
+! --- analytics ---
+||google-analytics.com^
+||analytics.google.com^
+||ssl.google-analytics.com^
+||stats.g.doubleclick.net^
+||segment.com^
+||segment.io^
+||amplitude.com^
+||mixpanel.com^
+||heap.io$third-party
+||heapanalytics.com^
+||plausible.io^
+||matomo.cloud^
+||quantserve.com^
+||scorecardresearch.com^
+||chartbeat.com^
+||parsely.com^
+||newrelic.com^
+||nr-data.net^
+
+! --- tag managers ---
+||googletagmanager.com^
+||googletagservices.com^
+||tagsrvcs.com^
+||tealiumiq.com^
+||ensighten.com^
+
+! --- ad exchanges and verification ---
+||doubleclick.net^
+||googlesyndication.com^
+||googleadservices.com^
+||adservice.google.com^
+||amazon-adsystem.com^
+||adnxs.com^
+||rubiconproject.com^
+||pubmatic.com^
+||openx.net^
+||criteo.com^
+||criteo.net^
+||taboola.com^
+||outbrain.com^
+||sharethrough.com^
+||indexww.com^
+||casalemedia.com^
+||33across.com^
+||doubleverify.com^
+||moatads.com^
+||adsafeprotected.com^
+||teads.tv^
+||smartadserver.com^
+||bidswitch.net^
+||3lift.com^
+
+! --- social pixels ---
+||connect.facebook.net^
+||analytics.tiktok.com^
+||ads-twitter.com^
+||static.ads-twitter.com^
+||snap.licdn.com^
+||px.ads.linkedin.com^
+
+! --- session replay and heatmaps ---
+||hotjar.com^
+||fullstory.com^
+||mouseflow.com^
+||clarity.ms^
+||logrocket.com^
+||smartlook.com^
+||quantummetric.com^
+
+! --- error and performance telemetry ---
+||browser.sentry-cdn.com^
+||bugsnag.com^
+||rollbar.com^
+||datadoghq-browser-agent.com^
+||sentry.io^$third-party
+
+! --- consent banners (block the SDK, not the page) ---
+||cdn.cookielaw.org^
+||onetrust.com^
+||consensu.org^
+||quantcast.mgr.consensu.org^
+||trustarc.com^

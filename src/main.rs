@@ -1,8 +1,11 @@
+mod blocklist;
 mod net;
 
-use clap::{Parser, Subcommand, ValueEnum};
-use obscura::{Browser as ObscuraBrowser, Page};
+use blocklist::Blocklist;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use obscura::{Browser as ObscuraBrowser, InterceptResolution, Page};
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
 
@@ -38,9 +41,37 @@ enum Cmd {
         /// What to print when --js is absent
         #[arg(long, value_enum, default_value_t = Mode::Tree)]
         mode: Mode,
+        #[command(flatten)]
+        filters: FilterArgs,
     },
     /// Persistent page session: read JSONL {"js":"..."} from stdin
-    Serve,
+    Serve {
+        #[command(flatten)]
+        filters: FilterArgs,
+    },
+}
+
+#[derive(Args)]
+struct FilterArgs {
+    /// Do not block ad, analytics and telemetry requests
+    #[arg(long)]
+    no_block: bool,
+    /// Drop the built-in blocklist, keeping only --filter-list files
+    #[arg(long)]
+    no_default_filters: bool,
+    /// Additional Adblock Plus-syntax filter list file (repeatable), e.g. a
+    /// copy of https://easylist.to/easylist/easyprivacy.txt
+    #[arg(long, value_name = "PATH")]
+    filter_list: Vec<String>,
+}
+
+impl FilterArgs {
+    fn build(&self) -> Result<Option<Blocklist>, String> {
+        if self.no_block {
+            return Ok(None);
+        }
+        Blocklist::new(&self.filter_list, !self.no_default_filters).map(Some)
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -59,17 +90,65 @@ enum Browser {
 struct Engine {
     browser: ObscuraBrowser,
     page: Page,
+    /// Shared with the interception task so it can judge first- vs third-party
+    /// against the document currently loaded, not the one at startup.
+    page_url: Arc<Mutex<String>>,
+    blocked: Arc<Mutex<u64>>,
 }
 
 impl Engine {
-    async fn new(user_agent: Option<&str>) -> Result<Self, String> {
+    async fn new(user_agent: Option<&str>, blocklist: Option<Blocklist>) -> Result<Self, String> {
         let mut builder = ObscuraBrowser::builder();
         if let Some(user_agent) = user_agent {
             builder = builder.user_agent(user_agent);
         }
         let browser = builder.build().map_err(|e| e.to_string())?;
-        let page = browser.new_page().await.map_err(|e| e.to_string())?;
-        Ok(Self { browser, page })
+        let mut page = browser.new_page().await.map_err(|e| e.to_string())?;
+        let page_url = Arc::new(Mutex::new(String::new()));
+        let blocked = Arc::new(Mutex::new(0u64));
+
+        if let Some(blocklist) = blocklist {
+            let mut requests = page.enable_interception();
+            let task_url = Arc::clone(&page_url);
+            let task_blocked = Arc::clone(&blocked);
+            tokio::spawn(async move {
+                while let Some(request) = requests.recv().await {
+                    let source = task_url.lock().map(|u| u.clone()).unwrap_or_default();
+                    let deny = blocklist.blocks(&request.url, &source, &request.resource_type);
+                    let resolution = if deny {
+                        if let Ok(mut n) = task_blocked.lock() {
+                            *n += 1;
+                        }
+                        InterceptResolution::Fail {
+                            reason: "blocked by v8cli filter list".into(),
+                        }
+                    } else {
+                        InterceptResolution::Continue {
+                            url: None,
+                            method: None,
+                            headers: None,
+                            body: None,
+                        }
+                    };
+                    // A closed resolver means the page dropped the request; a
+                    // closed channel means the page is gone, so stop.
+                    if request.resolver.send(resolution).is_err() && requests.is_closed() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        Ok(Self {
+            browser,
+            page,
+            page_url,
+            blocked,
+        })
+    }
+
+    fn blocked_count(&self) -> u64 {
+        self.blocked.lock().map(|n| *n).unwrap_or(0)
     }
 
     fn add_cookies(&self, target: &Url, cookies: &[String]) -> Result<(), String> {
@@ -87,7 +166,15 @@ impl Engine {
     }
 
     async fn navigate(&mut self, url: &str) -> Result<(), String> {
+        // Publish before goto: the page's first subresource requests can reach
+        // the interception task while goto is still in flight.
+        if let Ok(mut current) = self.page_url.lock() {
+            *current = url.to_string();
+        }
         self.page.goto(url).await.map_err(|e| e.to_string())?;
+        if let Ok(mut current) = self.page_url.lock() {
+            *current = self.page.url();
+        }
         self.page.settle(SETTLE_MS).await;
         // Some SPAs enqueue their first useful work just after an apparently idle
         // turn. Re-enter the event loop across a short observation window instead
@@ -181,14 +268,14 @@ async fn run_cli() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Eval { code } => {
-            let mut engine = Engine::new(None).await?;
+            let mut engine = Engine::new(None, None).await?;
             engine.blank().await?;
             print_value(engine.execute(&code).await?);
         }
         Cmd::Run { file } => {
             let code =
                 std::fs::read_to_string(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
-            let mut engine = Engine::new(None).await?;
+            let mut engine = Engine::new(None, None).await?;
             engine.blank().await?;
             print_value(engine.execute(&code).await?);
         }
@@ -197,6 +284,7 @@ async fn run_cli() -> Result<(), String> {
             cookies_from_browser,
             js,
             mode,
+            filters,
         } => {
             let target = Url::parse(&url).map_err(|e| format!("open: invalid URL: {e}"))?;
             let import = match cookies_from_browser {
@@ -214,7 +302,11 @@ async fn run_cli() -> Result<(), String> {
                 None => None,
             };
 
-            let mut engine = Engine::new(import.as_ref().map(|i| i.user_agent.as_str())).await?;
+            let mut engine = Engine::new(
+                import.as_ref().map(|i| i.user_agent.as_str()),
+                filters.build()?,
+            )
+            .await?;
             if let Some(import) = &import {
                 engine.add_cookies(&target, &import.cookies)?;
             }
@@ -232,10 +324,14 @@ async fn run_cli() -> Result<(), String> {
                     Mode::Html => engine.html(),
                 }
             };
+            let blocked = engine.blocked_count();
+            if blocked > 0 {
+                eprintln!("filters: blocked {blocked} ad/telemetry requests");
+            }
             print_value(output);
         }
-        Cmd::Serve => {
-            let mut engine = Engine::new(None).await?;
+        Cmd::Serve { filters } => {
+            let mut engine = Engine::new(None, filters.build()?).await?;
             engine.blank().await?;
             serve(&mut engine).await;
         }
@@ -284,7 +380,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn page_scripts_promises_and_live_handles_work() {
-        let mut engine = Engine::new(None).await.unwrap();
+        let mut engine = Engine::new(None, None).await.unwrap();
         engine
             .navigate(
                 "data:text/html,<title>Dynamic</title><p id='x'>before</p><script>document.querySelector('%23x').textContent='after'</script>",

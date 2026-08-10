@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+adblock = { version = "0.13.2", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 clap = { version = "4.6.6", features = ["derive"] }
 cookie-scoop = "0.1.1"
 obscura = { git = "https://github.com/h4ckf0r0day/obscura", rev = "41f24d7a19d729b84c2c64ea8ef1d52711b94fab", default-features = false, features = ["api"] }

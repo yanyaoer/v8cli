@@ -108,6 +108,36 @@ Cookie。父域 Cookie 会保留经过边界校验的 `Domain`，以支持页面
 - 私密窗口中仅存在于内存的 Cookie 无法导入。
 - UA 根据已安装浏览器版本生成；自定义 UA、TLS 指纹和 Client Hints 不保证一致。
 
+## 广告/追踪拦截
+
+默认开启。内置一份小规模自撰过滤列表(`src/blocklist.txt`,Adblock Plus 语法),
+覆盖第三方广告、分析、tag manager、session replay、遥测和 cookie 同意 SDK。
+代码 CDN(jsdelivr/unpkg/cdnjs)、CAPTCHA 与任何第一方资源都不拦——它们可能承载正文。
+
+```sh
+v8cli open <url>                                   # 默认拦截
+v8cli open <url> --no-block                        # 关闭
+v8cli open <url> --filter-list easyprivacy.txt     # 追加社区列表(可重复)
+v8cli open <url> --no-default-filters --filter-list my.txt
+```
+
+社区列表**运行时加载**而非打包,以避开再分发许可问题
+([EasyList](https://easylist.to/pages/licence.html) 为 GPLv3/CC BY-SA 3.0 双许可,
+[Peter Lowe](https://pgl.yoyo.org/license/) 为自定义许可):
+
+```sh
+curl -o easyprivacy.txt https://easylist.to/easylist/easyprivacy.txt
+```
+
+拦截命中数会打到 stderr。实测在 theverge.com 上移除了 OneTrust 同意横幅的
+631 词样板文本,正文一字未少。
+
+**当前覆盖范围有限**:只作用于页面 JS 发起的 `fetch()`/XHR(Obscura 的
+`enable_interception` 范围)。parser 在初始 HTML 中发现的 `<script src>`
+走 `obscura-browser` 内部抓取路径,不经过拦截器,因此 `gpt.js`、
+`amazon-adsystem` 这类**前置广告脚本目前拦不掉**,提速也因此有限。
+补齐需要在 Obscura 侧加 hook。
+
 ## 设计边界
 
 - 不包含 CSS layout、paint、截图、PDF、视频或 WebGL。
