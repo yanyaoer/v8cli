@@ -58,18 +58,15 @@ enum Cmd {
         mode: Mode,
         #[command(flatten)]
         filters: FilterArgs,
-        /// Extra dwell after the page stops mutating, for content committed by a
-        /// late one-shot timer that leaves nothing to wait on
-        #[arg(long, value_name = "MS", default_value_t = 0)]
-        dwell: u64,
+        #[command(flatten)]
+        session: SessionArgs,
     },
     /// Persistent page session: read JSONL {"js":"..."} from stdin
     Serve {
         #[command(flatten)]
         filters: FilterArgs,
-        /// Extra dwell after the page stops mutating (see `open --dwell`)
-        #[arg(long, value_name = "MS", default_value_t = 0)]
-        dwell: u64,
+        #[command(flatten)]
+        session: SessionArgs,
     },
 }
 
@@ -96,6 +93,29 @@ impl FilterArgs {
     }
 }
 
+#[derive(Args)]
+struct SessionArgs {
+    /// Route requests through a proxy, e.g. http://127.0.0.1:8080
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+    /// Cookie jar file, read before navigating and written back afterwards so a
+    /// login survives across invocations. Created if absent.
+    #[arg(long, value_name = "PATH")]
+    state: Option<String>,
+    /// Extra dwell after the page stops mutating, for content committed by a
+    /// late one-shot timer that leaves nothing to wait on
+    #[arg(long, value_name = "MS", default_value_t = 0)]
+    dwell: u64,
+}
+
+#[derive(Default)]
+struct EngineConfig {
+    user_agent: Option<String>,
+    blocklist: Option<Blocklist>,
+    dwell_ms: u64,
+    proxy: Option<String>,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Mode {
     Tree,
@@ -119,14 +139,19 @@ struct Engine {
 }
 
 impl Engine {
-    async fn new(
-        user_agent: Option<&str>,
-        blocklist: Option<Blocklist>,
-        dwell_ms: u64,
-    ) -> Result<Self, String> {
+    async fn new(config: EngineConfig) -> Result<Self, String> {
+        let EngineConfig {
+            user_agent,
+            blocklist,
+            dwell_ms,
+            proxy,
+        } = config;
         let mut builder = ObscuraBrowser::builder();
-        if let Some(user_agent) = user_agent {
-            builder = builder.user_agent(user_agent);
+        if let Some(user_agent) = &user_agent {
+            builder = builder.user_agent(user_agent.as_str());
+        }
+        if let Some(proxy) = &proxy {
+            builder = builder.proxy(proxy.as_str());
         }
         let browser = builder.build().map_err(|e| e.to_string())?;
         let mut page = browser.new_page().await.map_err(|e| e.to_string())?;
@@ -172,6 +197,25 @@ impl Engine {
             page_url,
             dwell_ms,
         })
+    }
+
+    /// Missing file is not an error: the first run of a named session creates it.
+    fn load_state(&self, path: &str) -> Result<usize, String> {
+        let path = std::path::Path::new(path);
+        if !path.exists() {
+            return Ok(0);
+        }
+        self.browser
+            .cookies()
+            .load_from_file(path)
+            .map_err(|e| format!("cannot read state {}: {e}", path.display()))
+    }
+
+    fn save_state(&self, path: &str) -> Result<(), String> {
+        self.browser
+            .cookies()
+            .save_to_file(std::path::Path::new(path))
+            .map_err(|e| format!("cannot write state {path}: {e}"))
     }
 
     fn add_cookies(&self, target: &Url, cookies: &[String]) -> Result<(), String> {
@@ -270,6 +314,21 @@ impl Engine {
             self.navigate(target.as_str()).await?;
             return Ok("200".into());
         }
+        // A link click or form submit during this call recorded where the page
+        // wanted to go; follow it now so the caller never observes the old
+        // document behind a new `location`.
+        if let Some(pending) = self.page.evaluate("__v8cliTakeNav()").as_str() {
+            let pending: Value =
+                serde_json::from_str(pending).map_err(|e| format!("invalid navigation: {e}"))?;
+            if let Some(error) = pending.get("error").and_then(Value::as_str) {
+                return Err(error.to_string());
+            }
+            if let Some(target) = pending.get("url").and_then(Value::as_str) {
+                let target = target.to_string();
+                self.navigate(&target).await?;
+                return Ok(target);
+            }
+        }
         if result.get("undefined") == Some(&Value::Bool(true)) {
             return Ok(String::new());
         }
@@ -305,14 +364,14 @@ async fn run_cli() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Eval { code } => {
-            let mut engine = Engine::new(None, None, 0).await?;
+            let mut engine = Engine::new(EngineConfig::default()).await?;
             engine.blank().await?;
             print_value(engine.execute(&code).await?);
         }
         Cmd::Run { file } => {
             let code =
                 std::fs::read_to_string(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
-            let mut engine = Engine::new(None, None, 0).await?;
+            let mut engine = Engine::new(EngineConfig::default()).await?;
             engine.blank().await?;
             print_value(engine.execute(&code).await?);
         }
@@ -322,7 +381,7 @@ async fn run_cli() -> Result<(), String> {
             js,
             mode,
             filters,
-            dwell,
+            session,
         } => {
             let target = Url::parse(&url).map_err(|e| format!("open: invalid URL: {e}"))?;
             let import = match cookies_from_browser {
@@ -340,12 +399,16 @@ async fn run_cli() -> Result<(), String> {
                 None => None,
             };
 
-            let mut engine = Engine::new(
-                import.as_ref().map(|i| i.user_agent.as_str()),
-                filters.build()?,
-                dwell,
-            )
+            let mut engine = Engine::new(EngineConfig {
+                user_agent: import.as_ref().map(|i| i.user_agent.clone()),
+                blocklist: filters.build()?,
+                dwell_ms: session.dwell,
+                proxy: session.proxy.clone(),
+            })
             .await?;
+            if let Some(path) = &session.state {
+                engine.load_state(path)?;
+            }
             if let Some(import) = &import {
                 engine.add_cookies(&target, &import.cookies)?;
             }
@@ -363,12 +426,27 @@ async fn run_cli() -> Result<(), String> {
                     Mode::Html => engine.html(),
                 }
             };
+            if let Some(path) = &session.state {
+                engine.save_state(path)?;
+            }
             print_value(output);
         }
-        Cmd::Serve { filters, dwell } => {
-            let mut engine = Engine::new(None, filters.build()?, dwell).await?;
+        Cmd::Serve { filters, session } => {
+            let mut engine = Engine::new(EngineConfig {
+                blocklist: filters.build()?,
+                dwell_ms: session.dwell,
+                proxy: session.proxy.clone(),
+                ..Default::default()
+            })
+            .await?;
+            if let Some(path) = &session.state {
+                engine.load_state(path)?;
+            }
             engine.blank().await?;
             serve(&mut engine).await;
+            if let Some(path) = &session.state {
+                engine.save_state(path)?;
+            }
         }
     }
     Ok(())
@@ -415,7 +493,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn page_scripts_promises_and_live_handles_work() {
-        let mut engine = Engine::new(None, None, 0).await.unwrap();
+        let mut engine = Engine::new(EngineConfig::default()).await.unwrap();
         engine
             .navigate(
                 "data:text/html,<title>Dynamic</title><p id='x'>before</p><script>document.querySelector('%23x').textContent='after'</script>",
@@ -440,5 +518,122 @@ mod tests {
             .await
             .unwrap();
         assert!(engine.tree().await.unwrap().contains("text \"changed\""));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interaction_helpers_drive_form_controls() {
+        let mut engine = Engine::new(EngineConfig::default()).await.unwrap();
+        engine
+            .navigate(
+                "data:text/html,<input id='i'><input type='checkbox' id='c'><button id='b' \
+                 onclick='window.out=i.value+\"/\"+c.checked'>go</button>",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(engine.execute("fill('#i', 'typed')").await.unwrap(), "typed");
+        assert_eq!(engine.execute("check('#c')").await.unwrap(), "true");
+        engine.execute("click('#b')").await.unwrap();
+        assert_eq!(engine.execute("window.out").await.unwrap(), "typed/true");
+        // handles from the tree address the same nodes as selectors do
+        engine.tree().await.unwrap();
+        assert_eq!(engine.execute("fill(0, 'byhandle')").await.unwrap(), "byhandle");
+    }
+
+    /// Serves a page with a link and a GET form; `/next` and `/search` report
+    /// what they were reached with. Only http(s) navigations are honoured, so
+    /// these cases cannot be expressed with `data:` URLs.
+    fn spawn_site() -> String {
+        // Obscura refuses private addresses unless told otherwise; these tests
+        // deliberately talk to a loopback server so they stay hermetic.
+        unsafe { std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1") };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                use std::io::{Read, Write};
+                let mut stream = stream;
+                let mut buf = [0u8; 2048];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body = if path.starts_with("/next") {
+                    "<title>Second</title><p>arrived</p>".to_string()
+                } else if path.starts_with("/search") {
+                    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+                    format!("<title>Results</title><p>query={query}</p>")
+                } else {
+                    "<title>First</title><a href=\"/next\">go</a>\
+                     <form action=\"/search\"><input name=\"q\"><input name=\"skip\" disabled>\
+                     <input type=\"submit\" name=\"btn\" value=\"x\"></form>"
+                        .to_string()
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        base
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clicking_a_link_replaces_the_document_rather_than_only_location() {
+        let base = spawn_site();
+        let mut engine = Engine::new(EngineConfig::default()).await.unwrap();
+        engine.navigate(&base).await.unwrap();
+
+        engine.execute("click('a')").await.unwrap();
+        // The old document must be gone, not merely shadowed by a new location.
+        assert_eq!(engine.execute("document.title").await.unwrap(), "Second");
+        assert!(engine.text().await.unwrap().contains("arrived"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_form_submits_the_successful_controls() {
+        let base = spawn_site();
+        let mut engine = Engine::new(EngineConfig::default()).await.unwrap();
+        engine.navigate(&base).await.unwrap();
+
+        engine.execute("fill('input[name=q]', 'a b')").await.unwrap();
+        engine.execute("submit('form')").await.unwrap();
+
+        assert_eq!(engine.execute("document.title").await.unwrap(), "Results");
+        let text = engine.text().await.unwrap();
+        assert!(text.contains("q=a+b"), "query not submitted: {text}");
+        assert!(!text.contains("skip"), "disabled control was submitted: {text}");
+        assert!(!text.contains("btn"), "submit button was submitted: {text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_form_submission_reports_instead_of_silently_doing_nothing() {
+        let mut engine = Engine::new(EngineConfig::default()).await.unwrap();
+        engine
+            .navigate("data:text/html,<form method='post' action='https://example.com/x'><input name='u'></form>")
+            .await
+            .unwrap();
+
+        let error = engine.execute("submit('form')").await.unwrap_err();
+        assert!(error.contains("POST"), "unexpected error: {error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_resolves_once_the_page_commits() {
+        let mut engine = Engine::new(EngineConfig::default()).await.unwrap();
+        engine
+            .navigate(
+                "data:text/html,<p id='o'>loading</p><script>setTimeout(() => { \
+                 document.getElementById('o').textContent = 'ready' }, 200)</script>",
+            )
+            .await
+            .unwrap();
+
+        let value = engine
+            .execute("waitFor(() => $('#o').textContent === 'ready', 4000).then(() => $('#o').text)")
+            .await
+            .unwrap();
+        assert_eq!(value, "ready");
     }
 }

@@ -61,7 +61,17 @@ v8cli open https://example.com/account --cookies-from-browser chrome
 
 # 持久页面会话
 v8cli serve
+
+# 登录态跨进程保持（cookie jar，首次运行自动创建）
+v8cli open https://app.example.com/login --state ./session.json
+v8cli open https://app.example.com/inbox --state ./session.json
+
+# 代理
+v8cli open https://example.com --proxy http://127.0.0.1:8080
 ```
+
+`--state` 只保存 cookie，不含 localStorage；把 token 存在 localStorage 的站点
+仍需每次登录。state 文件是明文，加入 `.gitignore`。
 
 X 等 CSR 页面会执行其应用脚本后再提取内容：
 
@@ -100,6 +110,22 @@ stdin 每行接受 `{"js":"..."}`，也接受裸 JavaScript；stdout 每行返�
 | `Element.text` | 归一化 `textContent` |
 | `NodeList.map(...)` | Agent 友好的数组映射兼容方法 |
 | `openPage(url)` | `serve` 会话中导航，成功返回 `200` |
+| `$(sel)` / `$$(sel)` | `querySelector` / `querySelectorAll`（返回数组） |
+| `click(t)` | 点击。`t` 可以是树里的 handle、CSS 选择器或 Element |
+| `fill(t, v)` / `type(t, v)` | 写入表单值（走原型 setter + `input`/`change`，React 可见） |
+| `select(t, v)` / `check(t, on)` | 下拉选择 / 勾选 |
+| `submit(t)` | 提交表单（仅 GET，见下） |
+| `waitFor(sel\|fn, ms)` | 等待元素出现或条件成立，返回 Promise |
+| `waitForText(s, ms)` | 等待正文出现某段文本 |
+
+### 导航是宿主接管的
+
+只有宿主能替换 document。点击链接或提交表单会被捕获成导航意图交给宿主执行，
+因此 `click("a")` 之后读到的是**新页面**。这一点此前是坏的：`location` 会变而
+DOM 不变，调用方会读到旧内容却以为已经跳转。History API（SPA 路由）不受影响。
+
+**POST 表单不支持**——宿主只能以 GET 导航，遇到 POST 表单会明确报错而不是静默
+失败，改用 `fetch()` 发请求。
 
 页面原生 `<script>`、外部脚本、Promise、timer、`fetch` 和 XHR 由 Obscura
 PageScript 运行时处理。页面脚本错误会尽量降级，不终止整个 CLI 会话。

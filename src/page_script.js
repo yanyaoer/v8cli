@@ -176,6 +176,155 @@
   globalThis.el = (id) => document.node(id);
   globalThis.openPage = (url) => ({ __v8cliNavigate: String(url) });
 
+  // Only the host can replace the document, so a link click or form submit
+  // would otherwise move `location` while leaving the old DOM in place — the
+  // caller reads stale content believing it navigated. Capture the intent and
+  // let the host perform a real navigation. History API calls are untouched:
+  // an SPA route change is not a document fetch.
+  // `new FormData(form)` yields nothing on this DOM, so collect the successful
+  // controls directly, following the form-submission rules that matter here:
+  // named and enabled, checkables only when checked, buttons excluded.
+  const formQuery = (form) => {
+    const params = new URLSearchParams();
+    for (const field of form.querySelectorAll("input, select, textarea")) {
+      if (!field.name || field.disabled) continue;
+      const type = (field.getAttribute("type") || "").toLowerCase();
+      if (["submit", "button", "reset", "image", "file"].includes(type)) continue;
+      if ((type === "checkbox" || type === "radio") && !field.checked) continue;
+      params.append(field.name, field.value ?? "");
+    }
+    return params.toString();
+  };
+
+  // Holds `{url}` or `{error}`. Throwing from a listener would be swallowed by
+  // the dispatcher and the action would look like it succeeded, so failures are
+  // recorded and reported by the host instead.
+  globalThis.__v8cliNav = null;
+  document.addEventListener("click", (event) => {
+    if (event.defaultPrevented || event.button) return;
+    const anchor = event.target?.closest?.("a[href]");
+    const href = anchor?.getAttribute("href");
+    if (!href || href.startsWith("#") || /^javascript:/i.test(href)) return;
+    let resolved;
+    try { resolved = new URL(href, location.href); } catch { return; }
+    if (!/^https?:$/.test(resolved.protocol)) return;
+    if (resolved.href.split("#")[0] === location.href.split("#")[0]) return;
+    event.preventDefault();
+    globalThis.__v8cliNav = { url: resolved.href };
+  }, true);
+  document.addEventListener("submit", (event) => {
+    if (event.defaultPrevented) return;
+    const form = event.target;
+    if (!form || form.tagName !== "FORM") return;
+    let action;
+    try { action = new URL(form.getAttribute("action") || location.href, location.href); }
+    catch (error) { globalThis.__v8cliNav = { error: `cannot resolve form action: ${error}` }; return; }
+    event.preventDefault();
+    if ((form.getAttribute("method") || "get").toLowerCase() !== "get") {
+      globalThis.__v8cliNav = { error:
+        "POST form submission is unsupported: the host can only navigate with GET. " +
+        "Issue the request with fetch(), then openPage() the result if it redirects." };
+      return;
+    }
+    action.search = formQuery(form);
+    globalThis.__v8cliNav = { url: action.href };
+  }, true);
+  globalThis.__v8cliTakeNav = () => {
+    const target = globalThis.__v8cliNav;
+    globalThis.__v8cliNav = null;
+    return target ? JSON.stringify(target) : null;
+  };
+
+  // Interaction helpers. `target` is a tree handle, a CSS selector, or an
+  // Element, so a caller can act on what `tree()` printed without restating it
+  // as a selector.
+  const resolve = (target) => {
+    if (target && target.nodeType === 1) return target;
+    if (typeof target === "number") return document.node(target);
+    if (typeof target === "string") {
+      const found = document.querySelector(target);
+      if (!found) throw new Error(`no element matches ${JSON.stringify(target)}`);
+      return found;
+    }
+    throw new TypeError("target must be a handle, selector or Element");
+  };
+  globalThis.$ = (selector) => document.querySelector(selector);
+  globalThis.$$ = (selector) => Array.from(document.querySelectorAll(selector));
+
+  const fire = (node, type, init) =>
+    node.dispatchEvent(new (type === "click" ? MouseEvent : Event)(type, { bubbles: true, cancelable: true, ...init }));
+
+  // Frameworks track the value through the prototype's setter and ignore a
+  // plain assignment, so write through it and then announce the change.
+  const setValue = (node, value) => {
+    const proto = Object.getPrototypeOf(node);
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(node, value);
+    else node.value = value;
+    fire(node, "input");
+    fire(node, "change");
+  };
+
+  globalThis.click = (target) => {
+    const node = resolve(target);
+    node.focus?.();
+    node.click();
+    return true;
+  };
+  globalThis.fill = (target, value) => {
+    const node = resolve(target);
+    node.focus?.();
+    setValue(node, String(value));
+    return node.value;
+  };
+  globalThis.type = (target, text) => {
+    const node = resolve(target);
+    node.focus?.();
+    setValue(node, String(node.value ?? "") + String(text));
+    return node.value;
+  };
+  globalThis.select = (target, value) => {
+    const node = resolve(target);
+    setValue(node, String(value));
+    return node.value;
+  };
+  globalThis.check = (target, on = true) => {
+    const node = resolve(target);
+    node.checked = !!on;
+    fire(node, "input");
+    fire(node, "change");
+    return node.checked;
+  };
+  globalThis.submit = (target) => {
+    const form = resolve(target ?? "form");
+    if (!fire(form, "submit")) return false;
+    form.submit?.();
+    return true;
+  };
+
+  // Resolves once `condition` holds. The host drives the event loop while this
+  // promise is pending, so the page keeps running between polls.
+  globalThis.waitFor = (condition, timeoutMs = 5000) => {
+    const test = typeof condition === "function"
+      ? condition
+      : () => document.querySelector(String(condition));
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve, reject) => {
+      const poll = () => {
+        let hit;
+        try { hit = test(); } catch (error) { return reject(error); }
+        if (hit) return resolve(hit === true ? true : hit);
+        if (Date.now() > deadline) {
+          return reject(new Error(`waitFor timed out after ${timeoutMs}ms`));
+        }
+        setTimeout(poll, 50);
+      };
+      poll();
+    });
+  };
+  globalThis.waitForText = (needle, timeoutMs = 5000) =>
+    waitFor(() => (document.body?.textContent || "").includes(String(needle)), timeoutMs);
+
   const safeValue = (value) => {
     if (value === undefined) return { undefined: true };
     if (typeof value === "string") return { value };
