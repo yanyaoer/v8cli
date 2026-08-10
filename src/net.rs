@@ -30,7 +30,11 @@ pub async fn import_browser(browser: Browser, target: &Url) -> Result<BrowserImp
     }
 
     let result = cookie_scoop::get_cookies(options).await;
-    let cookies: Vec<String> = result.cookies.iter().filter_map(scoped_cookie).collect();
+    let cookies: Vec<String> = result
+        .cookies
+        .iter()
+        .filter_map(|cookie| scoped_cookie(cookie, target))
+        .collect();
     let mut warnings = result.warnings;
     if cookies.is_empty() {
         warnings.push(format!(
@@ -47,10 +51,24 @@ pub async fn import_browser(browser: Browser, target: &Url) -> Result<BrowserImp
     })
 }
 
-fn scoped_cookie(cookie: &Cookie) -> Option<String> {
+fn scoped_cookie(cookie: &Cookie, target: &Url) -> Option<String> {
     if !valid_cookie_name(&cookie.name) || !valid_cookie_value(&cookie.value) {
         return None;
     }
+    let host = target.host_str()?.to_ascii_lowercase();
+    let domain = cookie
+        .domain
+        .as_deref()
+        .map(|domain| domain.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty());
+    let parent_domain = match domain {
+        Some(domain) if domain == host => None,
+        Some(domain) if valid_cookie_domain(&domain) && host.ends_with(&format!(".{domain}")) => {
+            Some(domain)
+        }
+        Some(_) => return None,
+        None => None,
+    };
     let path = cookie.path.as_deref().unwrap_or("/");
     let path = if path.starts_with('/')
         && !path.contains(';')
@@ -61,7 +79,11 @@ fn scoped_cookie(cookie: &Cookie) -> Option<String> {
     } else {
         "/"
     };
-    let mut value = format!("{}={}; Path={path}", cookie.name, cookie.value);
+    let mut value = format!("{}={}", cookie.name, cookie.value);
+    if let Some(domain) = parent_domain {
+        value.push_str(&format!("; Domain={domain}"));
+    }
+    value.push_str(&format!("; Path={path}"));
     if cookie.secure.unwrap_or(false) {
         value.push_str("; Secure");
     }
@@ -106,6 +128,16 @@ fn valid_cookie_value(value: &str) -> bool {
             || (0x3c..=0x5b).contains(&b)
             || (0x5d..=0x7e).contains(&b)
     })
+}
+
+fn valid_cookie_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && domain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
 fn browser_user_agent(browser: Browser) -> Result<String, String> {
@@ -276,9 +308,27 @@ mod tests {
     }
 
     #[test]
-    fn imported_cookie_is_host_scoped_and_preserves_flags() {
-        let value = scoped_cookie(&cookie("/account", true)).unwrap();
-        assert_eq!(value, "session=secret; Path=/account; Secure; HttpOnly");
-        assert!(!value.contains("Domain="));
+    fn imported_cookie_preserves_safe_parent_domain_and_flags() {
+        let target = Url::parse("https://www.example.com/account").unwrap();
+        let value = scoped_cookie(&cookie("/account", true), &target).unwrap();
+        assert_eq!(
+            value,
+            "session=secret; Domain=example.com; Path=/account; Secure; HttpOnly"
+        );
+    }
+
+    #[test]
+    fn exact_host_cookie_stays_host_only() {
+        let target = Url::parse("https://example.com/account").unwrap();
+        let value = scoped_cookie(&cookie("/", false), &target).unwrap();
+        assert_eq!(value, "session=secret; Path=/; HttpOnly");
+    }
+
+    #[test]
+    fn cookie_for_unrelated_domain_is_rejected() {
+        let target = Url::parse("https://example.com/").unwrap();
+        let mut cookie = cookie("/", false);
+        cookie.domain = Some("notexample.com".into());
+        assert!(scoped_cookie(&cookie, &target).is_none());
     }
 }

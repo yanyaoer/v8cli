@@ -98,8 +98,9 @@ PageScript 运行时处理。页面脚本错误会尽量降级，不终止整个
 ## 浏览器 Cookie
 
 `--cookies-from-browser` 使用 Rust crate `cookie-scoop`，只选择目标 URL 可用的
-Cookie。导入时故意移除 `Domain`，将凭据收窄为目标主机的 host-only Cookie，
-同时保留 `Path`、`Secure` 和 `HttpOnly`。
+Cookie。父域 Cookie 会保留经过边界校验的 `Domain`，以支持页面访问同站 API
+子域；目标主机自身的 Cookie 保持 host-only。`Path`、`Secure` 和 `HttpOnly`
+属性也会保留。
 
 - Safari 仅支持 macOS，终端通常需要“完全磁盘访问权限”。
 - Chrome 自动选择最近活跃的本地 Profile；macOS 可能弹出

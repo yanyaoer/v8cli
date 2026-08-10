@@ -99,9 +99,9 @@ impl Engine {
             .as_bool()
             .unwrap_or(false);
         if has_scripts {
-            for _ in 0..8 {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                self.page.settle(750).await;
+            for _ in 0..2 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                self.page.settle(500).await;
             }
         }
         self.install_page_api()?;
