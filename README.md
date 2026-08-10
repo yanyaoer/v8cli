@@ -24,9 +24,18 @@ Engine                         会话、导航、settle、Cookie
     └── Outbound               HTTP、CORS、请求头、页面 CookieJar
 ```
 
-页面完成 `load` 后先进行最长 5 秒的自适应 settle；含脚本的页面还会经过短暂的
-观察窗口，再从脚本修改后的实时 DOM 生成语义树。没有维护第二份只读 DOM，树中
-的 handle 始终指向当前页面节点。
+页面完成 `load` 后先进行最长 5 秒的自适应 settle。`load` 对 CSR 页面来说太早——
+触发时拿到的往往是空壳，框架首次渲染在其后，所以之后还有一个观察窗口：
+一个 MutationObserver 作为 preload script 提前装好，观察循环只读它的计数器判断
+DOM 是否还在变，稳定即退出。静态页因此只付一轮(约 12ms)，仍在填充的页面则
+按需要拿到更多轮。语义树从脚本修改后的实时 DOM 生成，没有第二份只读 DOM。
+
+超出 Obscura 静默启发式的孤立 one-shot timer 不留任何可等待的痕迹，用
+`--dwell <ms>` 显式换取：
+
+```sh
+v8cli open <url> --dwell 1200      # 捕获 1.5s 才提交内容的页面
+```
 
 ## 用法
 

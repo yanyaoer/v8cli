@@ -11,6 +11,21 @@ use url::Url;
 
 const PAGE_SCRIPT: &str = include_str!("page_script.js");
 const SETTLE_MS: u64 = 5_000;
+/// Budget for one observation round. Obscura returns from `settle` as soon as
+/// the page is quiescent, so this is a ceiling, not a delay.
+const OBSERVE_MS: u64 = 500;
+const OBSERVE_ROUNDS: usize = 4;
+
+/// Counts DOM mutations so the observation loop can ask "did anything change?"
+/// without walking the document. Installed as a preload script so it is
+/// watching before the page's own scripts run.
+const MUTATION_OBSERVER: &str = "\
+(() => { \
+  if (globalThis.__v8cliMutations !== undefined) return; \
+  globalThis.__v8cliMutations = 0; \
+  new MutationObserver(records => { globalThis.__v8cliMutations += records.length; }) \
+    .observe(document, { subtree: true, childList: true, characterData: true, attributes: true }); \
+})()";
 
 #[derive(Parser)]
 #[command(
@@ -43,11 +58,18 @@ enum Cmd {
         mode: Mode,
         #[command(flatten)]
         filters: FilterArgs,
+        /// Extra dwell after the page stops mutating, for content committed by a
+        /// late one-shot timer that leaves nothing to wait on
+        #[arg(long, value_name = "MS", default_value_t = 0)]
+        dwell: u64,
     },
     /// Persistent page session: read JSONL {"js":"..."} from stdin
     Serve {
         #[command(flatten)]
         filters: FilterArgs,
+        /// Extra dwell after the page stops mutating (see `open --dwell`)
+        #[arg(long, value_name = "MS", default_value_t = 0)]
+        dwell: u64,
     },
 }
 
@@ -93,16 +115,22 @@ struct Engine {
     /// Shared with the interception task so it can judge first- vs third-party
     /// against the document currently loaded, not the one at startup.
     page_url: Arc<Mutex<String>>,
+    dwell_ms: u64,
 }
 
 impl Engine {
-    async fn new(user_agent: Option<&str>, blocklist: Option<Blocklist>) -> Result<Self, String> {
+    async fn new(
+        user_agent: Option<&str>,
+        blocklist: Option<Blocklist>,
+        dwell_ms: u64,
+    ) -> Result<Self, String> {
         let mut builder = ObscuraBrowser::builder();
         if let Some(user_agent) = user_agent {
             builder = builder.user_agent(user_agent);
         }
         let browser = builder.build().map_err(|e| e.to_string())?;
         let mut page = browser.new_page().await.map_err(|e| e.to_string())?;
+        page.add_preload_script(MUTATION_OBSERVER);
         let page_url = Arc::new(Mutex::new(String::new()));
 
         if let Some(blocklist) = blocklist {
@@ -142,6 +170,7 @@ impl Engine {
             browser,
             page,
             page_url,
+            dwell_ms,
         })
     }
 
@@ -170,23 +199,37 @@ impl Engine {
             *current = self.page.url();
         }
         self.page.settle(SETTLE_MS).await;
-        // Some SPAs enqueue their first useful work just after an apparently idle
-        // turn. Re-enter the event loop across a short observation window instead
-        // of snapshotting the initial application shell. Static documents keep the
-        // fast path.
-        let has_scripts = self
-            .page
-            .evaluate("document.scripts && document.scripts.length > 0")
-            .as_bool()
-            .unwrap_or(false);
-        if has_scripts {
-            for _ in 0..2 {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                self.page.settle(500).await;
+        // Frameworks commonly commit their first render just after the page has
+        // gone quiet, so one settle can capture the application shell instead of
+        // its content. Keep re-entering the event loop while the document is
+        // still changing and stop as soon as it holds steady: a static document
+        // pays a single short round rather than a fixed delay, and a page that
+        // is still filling in gets as many rounds as it needs.
+        let mut previous = self.mutation_count();
+        for _ in 0..OBSERVE_ROUNDS {
+            self.page.settle(OBSERVE_MS).await;
+            let current = self.mutation_count();
+            if current == previous {
+                break;
             }
+            previous = current;
+        }
+        // A lone one-shot timer further out than Obscura's quiescence heuristics
+        // leaves no trace to wait on, so recovering it costs real dwell time.
+        // Opt-in rather than a tax on every page.
+        if self.dwell_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.dwell_ms)).await;
+            self.page.settle(OBSERVE_MS).await;
         }
         self.install_page_api()?;
         Ok(())
+    }
+
+    fn mutation_count(&mut self) -> u64 {
+        self.page
+            .evaluate("globalThis.__v8cliMutations || 0")
+            .as_u64()
+            .unwrap_or(0)
     }
 
     fn install_page_api(&mut self) -> Result<(), String> {
@@ -262,14 +305,14 @@ async fn run_cli() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Eval { code } => {
-            let mut engine = Engine::new(None, None).await?;
+            let mut engine = Engine::new(None, None, 0).await?;
             engine.blank().await?;
             print_value(engine.execute(&code).await?);
         }
         Cmd::Run { file } => {
             let code =
                 std::fs::read_to_string(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
-            let mut engine = Engine::new(None, None).await?;
+            let mut engine = Engine::new(None, None, 0).await?;
             engine.blank().await?;
             print_value(engine.execute(&code).await?);
         }
@@ -279,6 +322,7 @@ async fn run_cli() -> Result<(), String> {
             js,
             mode,
             filters,
+            dwell,
         } => {
             let target = Url::parse(&url).map_err(|e| format!("open: invalid URL: {e}"))?;
             let import = match cookies_from_browser {
@@ -299,6 +343,7 @@ async fn run_cli() -> Result<(), String> {
             let mut engine = Engine::new(
                 import.as_ref().map(|i| i.user_agent.as_str()),
                 filters.build()?,
+                dwell,
             )
             .await?;
             if let Some(import) = &import {
@@ -320,8 +365,8 @@ async fn run_cli() -> Result<(), String> {
             };
             print_value(output);
         }
-        Cmd::Serve { filters } => {
-            let mut engine = Engine::new(None, filters.build()?).await?;
+        Cmd::Serve { filters, dwell } => {
+            let mut engine = Engine::new(None, filters.build()?, dwell).await?;
             engine.blank().await?;
             serve(&mut engine).await;
         }
@@ -370,7 +415,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn page_scripts_promises_and_live_handles_work() {
-        let mut engine = Engine::new(None, None).await.unwrap();
+        let mut engine = Engine::new(None, None, 0).await.unwrap();
         engine
             .navigate(
                 "data:text/html,<title>Dynamic</title><p id='x'>before</p><script>document.querySelector('%23x').textContent='after'</script>",
