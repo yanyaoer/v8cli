@@ -114,7 +114,7 @@ stdin 每行接受 `{"js":"..."}`，也接受裸 JavaScript；stdout 每行返�
 | `click(t)` | 点击。`t` 可以是树里的 handle、CSS 选择器或 Element |
 | `fill(t, v)` / `type(t, v)` | 写入表单值（走原型 setter + `input`/`change`，React 可见） |
 | `select(t, v)` / `check(t, on)` | 下拉选择 / 勾选 |
-| `submit(t)` | 提交表单（仅 GET，见下） |
+| `submit(t)` | 提交表单（GET 与 POST 都走真实导航） |
 | `waitFor(sel\|fn, ms)` | 等待元素出现或条件成立，返回 Promise |
 | `waitForText(s, ms)` | 等待正文出现某段文本 |
 
@@ -124,8 +124,8 @@ stdin 每行接受 `{"js":"..."}`，也接受裸 JavaScript；stdout 每行返�
 因此 `click("a")` 之后读到的是**新页面**。这一点此前是坏的：`location` 会变而
 DOM 不变，调用方会读到旧内容却以为已经跳转。History API（SPA 路由）不受影响。
 
-**POST 表单不支持**——宿主只能以 GET 导航，遇到 POST 表单会明确报错而不是静默
-失败，改用 `fetch()` 发请求。
+POST 表单也走真实导航(经 `Page::goto_with_body`)，因此登录表单可用。
+未暴露的 Obscura 能力见 [docs/obscura-gaps.md](docs/obscura-gaps.md)。
 
 页面原生 `<script>`、外部脚本、Promise、timer、`fetch` 和 XHR 由 Obscura
 PageScript 运行时处理。页面脚本错误会尽量降级，不终止整个 CLI 会话。
@@ -184,7 +184,9 @@ Obscura 对 glob 是逐请求线性扫描,而 EasyPrivacy 一份就产生约 4.2
 
 ## 设计边界
 
-- 不包含 CSS layout、paint、截图、PDF、视频或 WebGL。
+- 本构建不含 CSS layout、paint、截图、PDF 或 WebGL。Obscura 另有 `render` feature
+  可提供截图，代价是 66k 行的 `obscura-render` 进入构建，且 facade 未导出——
+  见 [docs/obscura-gaps.md](docs/obscura-gaps.md)。
 - Web Platform API 覆盖取决于固定版本的 Obscura；不是完整 Chromium。
 - 没有 Chromium TLS/HTTP2 指纹，复杂 bot challenge 可能失败。
 - settle 与观察窗口是有界的；持续网络、长轮询或很晚发生的 DOM 更新可能看不到。
@@ -194,8 +196,10 @@ Obscura 对 glob 是逐请求线性扫描,而 EasyPrivacy 一份就产生约 4.2
 ## 本地 Obscura patch
 
 `Cargo.toml` 里有一条 `[patch]` 指向 `../obscura`,给公开的 `Page` 补上
-`set_blocked_urls`(该能力在 `obscura-browser` 内部早已存在,并同时被
-parser 脚本抓取循环和 JS runtime 使用,只是没在 facade crate 上暴露)。
+`set_blocked_urls` 和 `goto_with_body`(POST 导航),并修了 `wait_for_selector`
+不驱动事件循环、`FormData(form)` 忽略构造参数两个 bug。这些能力在 `obscura-browser`
+内部大多早已存在，只是没在 facade crate 上暴露——完整差集见
+[docs/obscura-gaps.md](docs/obscura-gaps.md)。
 
 因此**构建需要相邻目录有这份 fork**:
 
@@ -210,7 +214,7 @@ cd ../obscura && git checkout 41f24d7a19d729b84c2c64ea8ef1d52711b94fab
 ## 开发验证
 
 ```sh
-cargo test                                    # 15 passed
+cargo test                                    # 20 passed
 cargo clippy --all-targets -p v8cli -- -D warnings
 cargo build --release
 ```

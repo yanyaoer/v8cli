@@ -233,12 +233,35 @@ impl Engine {
     }
 
     async fn navigate(&mut self, url: &str) -> Result<(), String> {
-        // Publish before goto: the page's first subresource requests can reach
-        // the interception task while goto is still in flight.
+        self.announce(url);
+        self.page.goto(url).await.map_err(|e| e.to_string())?;
+        self.after_navigation().await
+    }
+
+    /// Navigation carrying a request body, for a form whose method is not GET.
+    async fn navigate_with_body(
+        &mut self,
+        url: &str,
+        method: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        self.announce(url);
+        self.page
+            .goto_with_body(url, method, body)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.after_navigation().await
+    }
+
+    /// Publish before navigating: the page's first subresource requests can
+    /// reach the interception task while the navigation is still in flight.
+    fn announce(&self, url: &str) {
         if let Ok(mut current) = self.page_url.lock() {
             *current = url.to_string();
         }
-        self.page.goto(url).await.map_err(|e| e.to_string())?;
+    }
+
+    async fn after_navigation(&mut self) -> Result<(), String> {
         if let Ok(mut current) = self.page_url.lock() {
             *current = self.page.url();
         }
@@ -325,7 +348,13 @@ impl Engine {
             }
             if let Some(target) = pending.get("url").and_then(Value::as_str) {
                 let target = target.to_string();
-                self.navigate(&target).await?;
+                match pending.get("method").and_then(Value::as_str) {
+                    Some(method) => {
+                        let body = pending.get("body").and_then(Value::as_str).unwrap_or("");
+                        self.navigate_with_body(&target, method, body).await?;
+                    }
+                    None => self.navigate(&target).await?,
+                }
                 return Ok(target);
             }
         }
@@ -557,7 +586,11 @@ mod tests {
                 let read = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..read]).to_string();
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
-                let body = if path.starts_with("/next") {
+                let method = request.split_whitespace().next().unwrap_or("GET").to_string();
+                let sent = request.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("").to_string();
+                let body = if path.starts_with("/login") {
+                    format!("<title>Posted</title><p>{method} body={}</p>", sent.trim_end_matches('\0'))
+                } else if path.starts_with("/next") {
                     "<title>Second</title><p>arrived</p>".to_string()
                 } else if path.starts_with("/search") {
                     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
@@ -565,7 +598,9 @@ mod tests {
                 } else {
                     "<title>First</title><a href=\"/next\">go</a>\
                      <form action=\"/search\"><input name=\"q\"><input name=\"skip\" disabled>\
-                     <input type=\"submit\" name=\"btn\" value=\"x\"></form>"
+                     <input type=\"submit\" name=\"btn\" value=\"x\"></form>\
+                     <form id=\"login\" method=\"post\" action=\"/login\">\
+                     <input name=\"user\"><input name=\"pw\" type=\"password\"></form>"
                         .to_string()
                 };
                 let _ = write!(
@@ -608,15 +643,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn post_form_submission_reports_instead_of_silently_doing_nothing() {
+    async fn post_form_submits_its_body_and_replaces_the_document() {
+        let base = spawn_site();
         let mut engine = Engine::new(EngineConfig::default()).await.unwrap();
-        engine
-            .navigate("data:text/html,<form method='post' action='https://example.com/x'><input name='u'></form>")
-            .await
-            .unwrap();
+        engine.navigate(&base).await.unwrap();
 
-        let error = engine.execute("submit('form')").await.unwrap_err();
-        assert!(error.contains("POST"), "unexpected error: {error}");
+        engine.execute("fill('#login [name=user]', 'ada')").await.unwrap();
+        engine.execute("fill('#login [name=pw]', 's3cret')").await.unwrap();
+        engine.execute("submit('#login')").await.unwrap();
+
+        assert_eq!(engine.execute("document.title").await.unwrap(), "Posted");
+        let text = engine.text().await.unwrap();
+        assert!(text.contains("POST"), "not sent as POST: {text}");
+        assert!(text.contains("user=ada"), "body missing fields: {text}");
+        assert!(text.contains("pw=s3cret"), "body missing fields: {text}");
     }
 
     #[tokio::test(flavor = "current_thread")]

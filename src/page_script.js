@@ -220,14 +220,13 @@
     try { action = new URL(form.getAttribute("action") || location.href, location.href); }
     catch (error) { globalThis.__v8cliNav = { error: `cannot resolve form action: ${error}` }; return; }
     event.preventDefault();
-    if ((form.getAttribute("method") || "get").toLowerCase() !== "get") {
-      globalThis.__v8cliNav = { error:
-        "POST form submission is unsupported: the host can only navigate with GET. " +
-        "Issue the request with fetch(), then openPage() the result if it redirects." };
-      return;
+    const method = (form.getAttribute("method") || "get").toUpperCase();
+    if (method === "GET") {
+      action.search = formQuery(form);
+      globalThis.__v8cliNav = { url: action.href };
+    } else {
+      globalThis.__v8cliNav = { url: action.href, method, body: formQuery(form) };
     }
-    action.search = formQuery(form);
-    globalThis.__v8cliNav = { url: action.href };
   }, true);
   globalThis.__v8cliTakeNav = () => {
     const target = globalThis.__v8cliNav;
