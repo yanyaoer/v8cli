@@ -1,12 +1,20 @@
-mod dom;
 mod net;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use obscura::{Browser as ObscuraBrowser, Page};
+use serde_json::Value;
+use std::time::Duration;
+use url::Url;
 
-const BOOTSTRAP: &str = include_str!("bootstrap.js");
+const PAGE_SCRIPT: &str = include_str!("page_script.js");
+const SETTLE_MS: u64 = 5_000;
 
 #[derive(Parser)]
-#[command(name = "v8cli", version, about = "Agent browser-lite: V8 isolate + DOM + fetch, no Chromium")]
+#[command(
+    name = "v8cli",
+    version,
+    about = "Agent browser-lite: mutable DOM + page JavaScript, no Chromium"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -14,22 +22,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Evaluate JS (fetch / parseHTML / DOM APIs available)
+    /// Evaluate JavaScript in a blank browser page
     Eval { code: String },
-    /// Run a JS file
+    /// Run a JavaScript file in a blank browser page
     Run { file: String },
-    /// Fetch a URL, bind it as `document`, then print a view or run JS
+    /// Navigate, execute page scripts, settle, then print a view or run JS
     Open {
         url: String,
-        /// JS to run against the page (overrides --mode)
+        /// Import cookies for this URL from Safari or Chrome and use that browser's User-Agent
+        #[arg(long, value_enum)]
+        cookies_from_browser: Option<Browser>,
+        /// JS to run against the settled page (overrides --mode)
         #[arg(long)]
         js: Option<String>,
         /// What to print when --js is absent
         #[arg(long, value_enum, default_value_t = Mode::Tree)]
         mode: Mode,
     },
-    /// Persistent session: read JSONL {"js": "..."} from stdin, reply one JSON per line.
-    /// Isolate, documents, cookies and globals live across requests.
+    /// Persistent page session: read JSONL {"js":"..."} from stdin
     Serve,
 }
 
@@ -40,71 +50,202 @@ enum Mode {
     Html,
 }
 
-fn main() {
-    let cli = Cli::parse();
+#[derive(Clone, Copy, ValueEnum)]
+enum Browser {
+    Safari,
+    Chrome,
+}
 
-    let platform = v8::new_default_platform(0, false).make_shared();
-    v8::V8::initialize_platform(platform);
-    v8::V8::initialize();
+struct Engine {
+    browser: ObscuraBrowser,
+    page: Page,
+}
 
-    let mut isolate = v8::Isolate::new(Default::default());
-    v8::scope!(let scope, &mut isolate);
-    let context = v8::Context::new(scope, Default::default());
-    let scope = &mut v8::ContextScope::new(scope, context);
-
-    install_ops(scope, context);
-    if let Err(e) = run(scope, BOOTSTRAP) {
-        eprintln!("bootstrap: {e}");
-        std::process::exit(1);
+impl Engine {
+    async fn new(user_agent: Option<&str>) -> Result<Self, String> {
+        let mut builder = ObscuraBrowser::builder();
+        if let Some(user_agent) = user_agent {
+            builder = builder.user_agent(user_agent);
+        }
+        let browser = builder.build().map_err(|e| e.to_string())?;
+        let page = browser.new_page().await.map_err(|e| e.to_string())?;
+        Ok(Self { browser, page })
     }
 
-    let code = match cli.cmd {
-        Cmd::Eval { code } => code,
-        Cmd::Run { file } => match std::fs::read_to_string(&file) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("cannot read {file}: {e}");
-                std::process::exit(1);
-            }
-        },
-        Cmd::Open { url, js, mode } => {
-            let open = format!("__openPage({})", serde_json::json!(url));
-            if let Err(e) = run(scope, &open) {
-                eprintln!("open: {e}");
-                std::process::exit(1);
-            }
-            js.unwrap_or_else(|| {
-                match mode {
-                    Mode::Tree => "document.tree()",
-                    Mode::Text => "document.text()",
-                    Mode::Html => "__rawHtml",
-                }
-                .to_string()
-            })
+    fn add_cookies(&self, target: &Url, cookies: &[String]) -> Result<(), String> {
+        let store = self.browser.cookies();
+        for cookie in cookies {
+            store
+                .set(cookie, target.as_str())
+                .map_err(|e| format!("cannot import cookie: {e}"))?;
         }
-        Cmd::Serve => {
-            serve(scope);
-            return;
-        }
-    };
+        Ok(())
+    }
 
-    match run(scope, &code) {
-        Ok(out) => {
-            if !out.is_empty() {
-                println!("{out}");
+    async fn blank(&mut self) -> Result<(), String> {
+        self.navigate("about:blank").await
+    }
+
+    async fn navigate(&mut self, url: &str) -> Result<(), String> {
+        self.page.goto(url).await.map_err(|e| e.to_string())?;
+        self.page.settle(SETTLE_MS).await;
+        // Some SPAs enqueue their first useful work just after an apparently idle
+        // turn. Re-enter the event loop across a short observation window instead
+        // of snapshotting the initial application shell. Static documents keep the
+        // fast path.
+        let has_scripts = self
+            .page
+            .evaluate("document.scripts && document.scripts.length > 0")
+            .as_bool()
+            .unwrap_or(false);
+        if has_scripts {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                self.page.settle(750).await;
             }
         }
-        Err(e) => {
-            eprintln!("js: {e}");
-            std::process::exit(1);
+        self.install_page_api()?;
+        Ok(())
+    }
+
+    fn install_page_api(&mut self) -> Result<(), String> {
+        let installed = self.page.evaluate(PAGE_SCRIPT);
+        if installed == Value::Bool(true) {
+            Ok(())
+        } else {
+            Err("failed to install agent page API".into())
         }
+    }
+
+    async fn execute(&mut self, code: &str) -> Result<String, String> {
+        let call = format!("__v8cliEval({})", serde_json::json!(code));
+        let mut result = self.page.evaluate(&call);
+
+        if let Some(ticket) = result.get("pending").and_then(Value::as_u64) {
+            let take = format!("__v8cliTake({ticket})");
+            for _ in 0..20 {
+                self.page.settle(500).await;
+                result = self.page.evaluate(&take);
+                if result.get("pending").is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if result.get("pending").is_some() {
+                return Err(format!("promise still pending after {SETTLE_MS}ms"));
+            }
+        }
+
+        if let Some(error) = result.get("error").and_then(Value::as_str) {
+            return Err(error.to_string());
+        }
+        if let Some(target) = result.get("navigate").and_then(Value::as_str) {
+            let target = Url::parse(target)
+                .or_else(|_| Url::parse(&self.page.url()).and_then(|base| base.join(target)))
+                .map_err(|e| format!("invalid navigation URL: {e}"))?;
+            self.navigate(target.as_str()).await?;
+            return Ok("200".into());
+        }
+        if result.get("undefined") == Some(&Value::Bool(true)) {
+            return Ok(String::new());
+        }
+        match result.get("value") {
+            Some(Value::String(value)) => Ok(value.clone()),
+            Some(value) => Ok(value.to_string()),
+            None => Err(format!("invalid page result: {result}")),
+        }
+    }
+
+    async fn tree(&mut self) -> Result<String, String> {
+        self.execute("document.tree()").await
+    }
+
+    async fn text(&mut self) -> Result<String, String> {
+        self.execute("document.text()").await
+    }
+
+    fn html(&mut self) -> String {
+        self.page.content()
     }
 }
 
-fn serve(scope: &mut v8::PinScope) {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if let Err(error) = run_cli().await {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli() -> Result<(), String> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Eval { code } => {
+            let mut engine = Engine::new(None).await?;
+            engine.blank().await?;
+            print_value(engine.execute(&code).await?);
+        }
+        Cmd::Run { file } => {
+            let code =
+                std::fs::read_to_string(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
+            let mut engine = Engine::new(None).await?;
+            engine.blank().await?;
+            print_value(engine.execute(&code).await?);
+        }
+        Cmd::Open {
+            url,
+            cookies_from_browser,
+            js,
+            mode,
+        } => {
+            let target = Url::parse(&url).map_err(|e| format!("open: invalid URL: {e}"))?;
+            let import = match cookies_from_browser {
+                Some(browser) => {
+                    let browser = match browser {
+                        Browser::Safari => net::Browser::Safari,
+                        Browser::Chrome => net::Browser::Chrome,
+                    };
+                    let import = net::import_browser(browser, &target).await?;
+                    for warning in &import.warnings {
+                        eprintln!("cookies: {warning}");
+                    }
+                    Some(import)
+                }
+                None => None,
+            };
+
+            let mut engine = Engine::new(import.as_ref().map(|i| i.user_agent.as_str())).await?;
+            if let Some(import) = &import {
+                engine.add_cookies(&target, &import.cookies)?;
+            }
+            engine
+                .navigate(target.as_str())
+                .await
+                .map_err(|e| format!("open: {e}"))?;
+
+            let output = if let Some(js) = js {
+                engine.execute(&js).await.map_err(|e| format!("js: {e}"))?
+            } else {
+                match mode {
+                    Mode::Tree => engine.tree().await?,
+                    Mode::Text => engine.text().await?,
+                    Mode::Html => engine.html(),
+                }
+            };
+            print_value(output);
+        }
+        Cmd::Serve => {
+            let mut engine = Engine::new(None).await?;
+            engine.blank().await?;
+            serve(&mut engine).await;
+        }
+    }
+    Ok(())
+}
+
+async fn serve(engine: &mut Engine) {
     use std::io::{BufRead, Write};
-    // keep stdout protocol-clean: console goes to stderr
-    let _ = run(scope, "Object.assign(console, { log: console.error, info: console.error });");
+
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -112,206 +253,61 @@ fn serve(scope: &mut v8::PinScope) {
         if line.trim().is_empty() {
             continue;
         }
-        // JSONL {"js": "..."} preferred; a raw JS line also works for manual use
-        let js = serde_json::from_str::<serde_json::Value>(&line)
+        let js = serde_json::from_str::<Value>(&line)
             .ok()
-            .and_then(|v| v["js"].as_str().map(String::from))
+            .and_then(|value| value["js"].as_str().map(String::from))
             .unwrap_or(line);
-        let resp = match run(scope, &js) {
-            Ok(v) => serde_json::json!({ "ok": true, "value": v }),
-            Err(e) => serde_json::json!({ "ok": false, "error": e }),
+        let response = match engine.execute(&js).await {
+            Ok(value) => serde_json::json!({ "ok": true, "value": value }),
+            Err(error) => serde_json::json!({ "ok": false, "error": error }),
         };
-        if writeln!(stdout, "{resp}").and_then(|_| stdout.flush()).is_err() {
+        if writeln!(stdout, "{response}")
+            .and_then(|_| stdout.flush())
+            .is_err()
+        {
             break;
         }
     }
 }
 
-fn run(scope: &mut v8::PinScope, code: &str) -> Result<String, String> {
-    v8::tc_scope!(let tc, scope);
-    let src = v8::String::new(tc, code).ok_or("source too large")?;
-    let result = v8::Script::compile(tc, src, None).and_then(|s| s.run(tc));
-    let Some(mut value) = result else {
-        let exc = tc.stack_trace().or_else(|| tc.exception());
-        return Err(match exc {
-            Some(v) => v.to_rust_string_lossy(tc),
-            None => "unknown error".to_string(),
-        });
-    };
-    if let Ok(p) = v8::Local::<v8::Promise>::try_from(value) {
-        match p.state() {
-            v8::PromiseState::Fulfilled => value = p.result(tc),
-            v8::PromiseState::Rejected => {
-                let msg = p.result(tc).to_rust_string_lossy(tc);
-                return Err(format!("unhandled rejection: {msg}"));
-            }
-            v8::PromiseState::Pending => {
-                return Err("promise still pending (no event loop; APIs are synchronous)".into());
-            }
-        }
-    }
-    Ok(format_value(tc, value))
-}
+fn print_value(value: String) {
+    use std::io::Write;
 
-fn format_value(scope: &v8::PinScope, v: v8::Local<v8::Value>) -> String {
-    if v.is_undefined() {
-        return String::new();
-    }
-    if v.is_string() {
-        return v.to_rust_string_lossy(scope);
-    }
-    if let Some(s) = v8::json::stringify(scope, v) {
-        let r = s.to_rust_string_lossy(scope);
-        if r != "undefined" {
-            return r;
-        }
-    }
-    v.to_rust_string_lossy(scope)
-}
-
-macro_rules! set_fn {
-    ($scope:expr, $global:expr, $name:expr, $cb:expr) => {{
-        let key = v8::String::new($scope, $name).unwrap();
-        let f = v8::Function::new($scope, $cb).unwrap();
-        $global.set($scope, key.into(), f.into());
-    }};
-}
-
-fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
-    let global = context.global(scope);
-    set_fn!(scope, global, "__host_print", cb_print);
-    set_fn!(scope, global, "__host_fetch", cb_fetch);
-    set_fn!(scope, global, "__host_parse", cb_parse);
-    set_fn!(scope, global, "__host_query", cb_query);
-    set_fn!(scope, global, "__host_query_all", cb_query_all);
-    set_fn!(scope, global, "__host_node", cb_node);
-    set_fn!(scope, global, "__host_text", cb_text);
-    set_fn!(scope, global, "__host_inner_html", cb_inner_html);
-    set_fn!(scope, global, "__host_doc_text", cb_doc_text);
-    set_fn!(scope, global, "__host_tree", cb_tree);
-    set_fn!(scope, global, "__host_resolve", cb_resolve);
-}
-
-fn throw(scope: &v8::PinScope, msg: &str) {
-    let m = v8::String::new(scope, msg).unwrap();
-    let e = v8::Exception::error(scope, m);
-    scope.throw_exception(e);
-}
-
-fn ret_str(scope: &v8::PinScope, rv: &mut v8::ReturnValue, s: &str) {
-    match v8::String::new(scope, s) {
-        Some(v) => rv.set(v.into()),
-        None => throw(scope, "string too large"),
+    if !value.is_empty() {
+        let _ = writeln!(std::io::stdout().lock(), "{value}");
     }
 }
 
-fn arg_doc(scope: &v8::PinScope, args: &v8::FunctionCallbackArguments, i: i32) -> Option<usize> {
-    let id = args.get(i).int32_value(scope).unwrap_or(-1);
-    if id < 0 {
-        throw(scope, "invalid document id");
-        return None;
-    }
-    Some(id as usize)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn cb_print(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut _rv: v8::ReturnValue) {
-    let level = args.get(0).to_rust_string_lossy(scope);
-    let msg = args.get(1).to_rust_string_lossy(scope);
-    if level == "log" {
-        println!("{msg}");
-    } else {
-        eprintln!("{msg}");
-    }
-}
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_scripts_promises_and_live_handles_work() {
+        let mut engine = Engine::new(None).await.unwrap();
+        engine
+            .navigate(
+                "data:text/html,<title>Dynamic</title><p id='x'>before</p><script>document.querySelector('%23x').textContent='after'</script>",
+            )
+            .await
+            .unwrap();
 
-fn cb_fetch(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let req = args.get(0).to_rust_string_lossy(scope);
-    let resp = net::fetch(&req);
-    ret_str(scope, &mut rv, &resp);
-}
+        let tree = engine.tree().await.unwrap();
+        assert!(tree.contains("title: Dynamic"));
+        assert!(tree.contains("text \"after\""));
 
-fn cb_parse(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let html = args.get(0).to_rust_string_lossy(scope);
-    let base = {
-        let a = args.get(1);
-        if a.is_string() {
-            Some(a.to_rust_string_lossy(scope))
-        } else {
-            None
-        }
-    };
-    let id = dom::parse(&html, base.as_deref());
-    rv.set(v8::Number::new(scope, id as f64).into());
-}
-
-fn cb_query(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let Some(id) = arg_doc(scope, &args, 0) else { return };
-    let root = args.get(1).int32_value(scope).unwrap_or(-1);
-    let sel = args.get(2).to_rust_string_lossy(scope);
-    match dom::query(id, root, &sel) {
-        Ok(h) => rv.set(v8::Integer::new(scope, h).into()),
-        Err(e) => throw(scope, &e),
-    }
-}
-
-fn cb_query_all(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let Some(id) = arg_doc(scope, &args, 0) else { return };
-    let root = args.get(1).int32_value(scope).unwrap_or(-1);
-    let sel = args.get(2).to_rust_string_lossy(scope);
-    match dom::query_all(id, root, &sel) {
-        Ok(json) => ret_str(scope, &mut rv, &json),
-        Err(e) => throw(scope, &e),
-    }
-}
-
-fn cb_node(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let Some(id) = arg_doc(scope, &args, 0) else { return };
-    let h = args.get(1).int32_value(scope).unwrap_or(-1);
-    match dom::node_info(id, h) {
-        Ok(json) => ret_str(scope, &mut rv, &json),
-        Err(e) => throw(scope, &e),
-    }
-}
-
-fn cb_text(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let Some(id) = arg_doc(scope, &args, 0) else { return };
-    let h = args.get(1).int32_value(scope).unwrap_or(-1);
-    match dom::text(id, h) {
-        Ok(s) => ret_str(scope, &mut rv, &s),
-        Err(e) => throw(scope, &e),
-    }
-}
-
-fn cb_inner_html(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let Some(id) = arg_doc(scope, &args, 0) else { return };
-    let h = args.get(1).int32_value(scope).unwrap_or(-1);
-    match dom::inner_html(id, h) {
-        Ok(s) => ret_str(scope, &mut rv, &s),
-        Err(e) => throw(scope, &e),
-    }
-}
-
-fn cb_doc_text(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let Some(id) = arg_doc(scope, &args, 0) else { return };
-    match dom::doc_text(id) {
-        Ok(s) => ret_str(scope, &mut rv, &s),
-        Err(e) => throw(scope, &e),
-    }
-}
-
-fn cb_resolve(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let Some(id) = arg_doc(scope, &args, 0) else { return };
-    let href = args.get(1).to_rust_string_lossy(scope);
-    match dom::resolve_url(id, &href) {
-        Ok(s) => ret_str(scope, &mut rv, &s),
-        Err(e) => throw(scope, &e),
-    }
-}
-
-fn cb_tree(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
-    let Some(id) = arg_doc(scope, &args, 0) else { return };
-    match dom::tree(id) {
-        Ok(s) => ret_str(scope, &mut rv, &s),
-        Err(e) => throw(scope, &e),
+        assert_eq!(engine.execute("Promise.resolve(42)").await.unwrap(), "42");
+        assert_eq!(
+            engine
+                .execute("new Promise(resolve => setTimeout(() => resolve(7), 25))")
+                .await
+                .unwrap(),
+            "7"
+        );
+        engine
+            .execute("el(0).textContent = 'changed'")
+            .await
+            .unwrap();
+        assert!(engine.tree().await.unwrap().contains("text \"changed\""));
     }
 }
